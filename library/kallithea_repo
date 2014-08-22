@@ -1,0 +1,563 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Ansible-module to manage Kallithea/RhodeCode repositories
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: kallithea_repo
+short_description: Manage repositories on a Kallithea/RhodeCode server.
+description:
+  - Manage repositories on a Kallithea/RhodeCode server.
+options:
+  api_key:
+    description:
+      - Kallithea/RhodeCode API key.
+      - The user to whom I(api_key) belongs must have all necessary
+        permissions.
+      - 'Alias: I(key)'
+    required: true
+  clone_uri:
+    description:
+      - http/https URL used for doing remote pulls.
+    required: false
+  description:
+    description:
+      - Repository description.
+    required: false
+  enable_downloads:
+    description:
+      - Enable download menu on summary page.
+    required: false
+    default: Server default
+  enable_locking:
+    description:
+      - Enable lock-by-pulling on repository.
+    required: false
+    default: Server default
+  enable_statistics:
+    description:
+      - Enable statistics window on summary page.
+    required: false
+    default: Server default
+  landing_rev:
+    description:
+      - Default revision for files page, downloads, whoosh and readme.
+      - Value is of the form C(revision_type:revision) with I(revision_type)
+        and I(revision) separated by C(:) (colon).
+      - Possible values for I(revision_type) are: C(rev), C(branch) or C(tag)
+      - Possible values for I(revision) are the branch or tag name or C(tip)
+        for I(revision_type) C(rev)
+    required: false
+    default: 'rev:tip'
+  name:
+    description:
+      - Repository name.
+      - Repository groups may be part of the name using C(/) (slash) as
+        separator.
+      - All necessary groups will be created: if I(name) is C(foo/bar/baz),
+        repository groups C(foo) and C(bar) will be created in addition to the
+        repository C(baz), which will land in group C(bar).
+    required: true
+  owner:
+    description:
+      - Repository owner.
+    required: false
+    default: Server default
+  private:
+    description:
+      - Is the repository Private?
+      - Private repositories are only visible to people explicitly added as
+        collaborators.
+    required: true
+    default: Server default
+  state:
+    description:
+      - Whether the repository should exist or not.
+      - If I(state) is C(query), information about the specified repository is
+        returned while nothing is changed.
+    choices: [present, absent, query]
+    required: false
+    default: present
+  type:
+    description:
+      - Repository Type.
+    choices: [git, hg]
+    required: false
+    default: Server default
+  url:
+    description:
+      - Kallithea/RhodeCode API URL.
+    required: false
+    default: https://localhost/_admin/api
+notes:
+  - At least Kallithea 0.0 or RhodeCode 2.2.5 required.
+  - Compatibility to RhodeCode is assumed, but not guaranteed. It is possible
+    that RhodeCode support might be dropped in the future.
+  - This module does not support addressing repositories via their repository
+    id.
+  - For URLs pointing to C(localhost)/C(127.0.0.1), SSL certificate
+    validation is disabled.
+
+requirements: [requests]
+author: Bernhard Weitzhofer
+'''
+
+EXAMPLES = '''
+# Make sure a certain git repository exists. All unspecified values are set
+# according to Kallithea/RhodeCode server defaults.
+- kallithea_repo: >
+    state=present
+    api_key=SOME_API_KEY
+    name=fantastiflare
+    type=git
+
+# Make sure the repository created before is private and change its owner to
+# "reed". All unspecified values are kept as they are.
+- kallithea_repo: >
+    api_key=SOME_API_KEY
+    name=fantastiflare
+    owner=reed
+    private=yes
+
+# Make sure a certain Mercurial repository exists within repository group
+# "research_projects". The repository group is created automatically if it
+# doesn't exist already.
+- kallithea_repo: >
+    state=present
+    api_key=SOME_API_KEY
+    name=research_projects/uniform_computer
+    owner=reed
+    type=hg
+
+# Make sure a certain repository is removed
+- kallithea_repo: >
+    api_key=SOME_API_KEY
+    state=absent
+    name=doombot
+'''
+
+###############################################################################
+#                                                                             #
+# The following code is the same for all Kallithea (kallithea_*) Modules.     #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+
+import json
+import re
+import urlparse
+import uuid
+try:
+    # requests does not support Python 2.4, but since this seems to be the case
+    # for other libraries used by the modules in Ansible core as well (current
+    # psycopg2 for example), functionallity of requests won't be replicated
+    # here for the moment.
+    import requests
+except ImportError:
+    requests = None
+
+
+class Error(Exception):
+    '''Custom base class for errors'''
+
+
+class APIError(Error):
+    '''Base class for errors reported by the Kallithea API'''
+
+
+# Workaround for the fact that Python 2.4 does not have "any" built-in.
+def any(iterable):
+    '''Return True if at least one element of iterable evaluates True.'''
+    for element in iterable:
+        if element:
+            return True
+    return False
+
+
+# Workaround for the fact that Python 2.4 does not have the 'hostname'
+# property for urlparse.urlsplit()-results (code adapted from recent
+# Python's urlparse.ResultMixin).
+def hostname(url):
+    '''Return hostname part of url or None if not existent.'''
+    netloc_ = urlparse.urlsplit(url)[1]
+    netloc = netloc_.split('@')[-1]
+    if '[' in netloc and ']' in netloc:
+        return netloc.split(']')[0][1:].lower()
+    elif ':' in netloc:
+        return netloc.split(':')[0].lower()
+    elif netloc == '':
+        return None
+    else:
+        return netloc.lower()
+
+
+def dict_without_none(*args, **kwargs):
+    '''Return Dictionary with entries having value None discarded.'''
+    dct = dict(*args, **kwargs)
+    return dict((k, v) for k, v in dct.iteritems() if v is not None)
+
+
+class Version(object):
+    '''Class representing comparable Software version Information.'''
+
+    def __init__(self, version_string):
+        self.verstr = version_string
+        self.ver = []
+        for part in version_string.split('.'):
+
+            # Split "num" and "rest" for each part of a version number. Any
+            # rest is considered smaller than no rest (the empty tuple is
+            # bigger than any string in Python 2)
+            raw_num, rest_ = re.match(r'([0-9]*)(.*)', part).groups()
+            num = int(raw_num or '0')
+            rest = rest_ or ()
+
+            self.ver.append((num, rest))
+
+    def __repr__(self):
+        return 'Version(%s)' % self.verstr
+
+    def __str__(self):
+        return self.verstr
+
+    def __cmp__(self, other):
+
+        # Pad with tuples representing zeroes (see __init__)
+        pad = lambda a, b: (a or (0, ()), b or (0, ()))
+        zipped_longest = map(pad, self.ver, other.ver)
+        s, o = zip(*zipped_longest)
+
+        if s < o:
+            return -1
+        elif s > o:
+            return 1
+        else:
+            return 0
+
+
+class Api(object):
+    '''A class to represent Kallithea's/RhodeCode's JSON-RPC-API'''
+
+    def __init__(self, url, api_key):
+        self.url = url
+        self.api_key = api_key
+        self._server_info = None
+
+        # prepare session
+        self.session = requests.Session()
+        self.session.headers.update({'content-type': 'application/json'})
+
+        # Don't verify SSL cert of local server (hostname wouldn't match)
+        if hostname(self.url) in ('localhost', '127.0.0.1'):
+            self.session.verify = False
+
+    def call(self, method, **kwargs):
+        '''Call a method of the Kallithea JSON-RPC API, return its results.'''
+        id_ = str(uuid.uuid4())  # a random uuid
+        payload = {
+            'id': id_,
+            'api_key': self.api_key,
+            'method': method,
+            'args': kwargs
+        }
+        try:
+            response = self.session.post(self.url, data=json.dumps(payload))
+        except Exception, e:
+            raise Error('%s: %s' % (type(e), e))
+
+        if response.status_code != 200:
+            raise Error('HTTP response had status code other than 200. '
+                        'This should not happen.')
+        data = response.json()
+        if data['id'] != id_:
+            raise Error('Response contained wrong id. This should not happen.')
+        if data['error'] is not None:
+            raise APIError(data['error'])
+        return data['result']
+
+    # shortcut for Client.call: client('foo', bar='baz') instead of
+    # client.call('foo', bar='baz')
+    __call__ = call
+
+    def _get_method(self, method):
+        '''Return a callable that calls a specific API method.'''
+
+        def m(**kwargs):
+            return self.call(method, **kwargs)
+
+        m.__doc__ = 'Return result of JSON-RPC API method "%s".' % method
+        return m
+
+    def __getattr__(self, name):
+        '''Return callable that calls API method corresponding to attr name.
+
+        This makes it possible to call client.foo(bar='baz') instead of
+        client.call('foo', bar='baz').
+
+        '''
+        return self._get_method(name)
+
+#                                                                             #
+# The above code is the same for all Kallithea (kallithea_*) Modules.         #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+###############################################################################
+
+
+class Stub(object):
+    '''Server Stub for Kallithea/RhodeCode (common functionality)'''
+
+    def __init__(self, api):
+        self.api = api
+
+    def repo_exists(self, name):
+        '''Return True if repository exists on Server.'''
+        # TODO: don't query ALL repositories
+        repos = self.api.get_repos()
+        return any(r['repo_name'] == name for r in repos)
+
+    def get_repo(self, name):
+        '''Return repository information'''
+        r = self.api.get_repo(repoid=name)
+        return dict(
+            clone_uri=r['clone_uri'],
+            description=r['description'],
+            enable_downloads=r['enable_downloads'],
+            enable_locking=r['enable_locking'],
+            enable_statistics=r['enable_statistics'],
+            landing_rev=':'.join(r['landing_rev']),
+            name=r['repo_name'],
+            owner=r['owner'],
+            private=r['private'],
+            type=r['repo_type'],
+        )
+
+    def diff_repo(self,
+                  name,
+                  clone_uri=None,
+                  description=None,
+                  enable_downloads=None,
+                  enable_locking=None,
+                  enable_statistics=None,
+                  landing_rev=None,
+                  owner=None,
+                  private=None,
+                  type=None,
+                  **throwaway):
+        '''Return keys whose values differ from current ones ...
+
+        ... for repo with specified name. None-values supplied to this method
+        are disregarded in the comparison.
+
+        '''
+        current = self.get_repo(name)
+        supplied = dict_without_none(
+            clone_uri=clone_uri,
+            description=description,
+            enable_downloads=enable_downloads,
+            enable_locking=enable_locking,
+            enable_statistics=enable_statistics,
+            landing_rev=landing_rev,
+            name=name,
+            owner=owner,
+            private=private,
+            type=type,
+        )
+        return [k for k, v in supplied.iteritems() if v != current[k]]
+
+    def create_repo(self,
+                    name,
+                    clone_uri=None,
+                    description=None,
+                    enable_downloads=None,
+                    enable_locking=None,
+                    enable_statistics=None,
+                    landing_rev=None,
+                    owner=None,
+                    private=None,
+                    type=None,
+                    **throwaway):
+        '''Create repository, return result of API call.'''
+        kwargs = dict_without_none(
+            clone_uri=clone_uri,
+            description=description,
+            enable_downloads=enable_downloads,
+            enable_locking=enable_locking,
+            enable_statistics=enable_statistics,
+            landing_rev=landing_rev,
+            owner=owner,
+            private=private,
+            repo_name=name,
+            repo_type=type,
+        )
+        return self.api.create_repo(**kwargs)
+
+    def update_repo(self,
+                    name,
+                    clone_uri=None,
+                    description=None,
+                    enable_downloads=None,
+                    enable_locking=None,
+                    enable_statistics=None,
+                    landing_rev=None,
+                    owner=None,
+                    private=None,
+                    **throwaway):
+        '''Update repository, return result of API call.'''
+        kwargs = dict_without_none(
+            clone_uri=clone_uri,
+            description=description,
+            enable_downloads=enable_downloads,
+            enable_locking=enable_locking,
+            enable_statistics=enable_statistics,
+            landing_rev=landing_rev,
+            owner=owner,
+            private=private,
+            repoid=name,
+        )
+        return self.api.update_repo(**kwargs)
+
+    def delete_repo(self, name):
+        '''Delete repository, return result of API call.'''
+        return self.api.delete_repo(repoid=name, forks='detach')
+
+
+class KallitheaStub(Stub):
+    '''Server stub for Kallithea (Kallithea-specific functionality)'''
+
+    # Add Kallithea-specific method overrides/implementations here
+
+
+class RhodeCodeStub(Stub):
+    '''Server stub for RhodeCode (RhodeCode-specific unctionality)'''
+
+    # Add RhodeCode-specific method overrides/implementations here
+
+
+def get_stub(api):
+    '''Determine server type and return corresponding stub.'''
+
+    # Minimum server versions
+    KALLITHEA_MIN_VER = Version('0.0')
+    RHODECODE_MIN_VER = Version('2.2.5')
+
+    # get server info
+    server_info = api.get_server_info()
+
+    # Create Server Stub based on server_info or fail
+    if 'kallithea_version' in server_info:
+        ver = Version(server_info['kallithea_version'])
+        if ver < KALLITHEA_MIN_VER:
+            raise Error('At least Kallithea %s required.' %
+                        KALLITHEA_MIN_VER)
+        return KallitheaStub(api)
+    elif 'rhodecode_version' in server_info:
+        ver = Version(server_info['rhodecode_version'])
+        if ver < RHODECODE_MIN_VER:
+            raise Error('At least RhodeCode %s required.' %
+                        RHODECODE_MIN_VER)
+        return RhodeCodeStub(api)
+    raise Error('Could not determine server type')
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            api_key=dict(required=True, aliases=['key']),
+            clone_uri=dict(),
+            description=dict(),
+            enable_downloads=dict(type='bool'),
+            enable_locking=dict(type='bool'),
+            enable_statistics=dict(type='bool'),
+            landing_rev=dict(default='rev:tip'),
+            name=dict(required=True),
+            owner=dict(),
+            private=dict(type='bool'),
+            state=dict(default='present',
+                       choices=['present', 'absent', 'query']),
+            type=dict(required=False, choices=['git', 'hg']),
+            url=dict(default='https://localhost/_admin/api'),
+        ),
+        supports_check_mode=True
+    )
+    params = module.params
+
+    # fail if import of requests failed
+    if not requests:
+        module.fail_json(msg='Python module "requests" must be installed.')
+
+    try:
+        api = Api(params['url'], params['api_key'])
+        server = get_stub(api)
+
+        # see if repo exists
+        repo_exists = server.repo_exists(params['name'])
+
+        if params['state'] == 'present':
+            if not repo_exists:
+                # create repo (or pretend to if check mode)
+                if module.check_mode:
+                    result = dict(changed=True)
+                else:
+                    r = server.create_repo(**params)
+                    result = dict(changed=True, result=r)
+
+            else:  # repo exists
+                # determine which fields would change
+                diff = server.diff_repo(**params)
+
+                # fail request to switch between repository types
+                if 'type' in diff:
+                    module.fail_json(msg='The type of an existing '
+                                         'repository cannot be changed')
+
+                # update repo if necessary (or pretend to if check mode)
+                if module.check_mode:
+                    result = dict(changed=bool(diff))
+                elif diff:
+                    r = server.update_repo(**params)
+                    result = dict(changed=True, changed_attrs=diff, result=r)
+                else:
+                    result = dict(changed=False)
+
+        elif params['state'] == 'absent':
+            changed = repo_exists
+
+            # remove repo if necessary (or pretend to if check mode)
+            if module.check_mode:
+                result = dict(changed=changed)
+            elif changed:
+                r = server.delete_repo(params['name'])
+                result = dict(changed=True, result=r)
+            else:
+                result = dict(changed=False)
+
+        else:  # state == 'query'
+            if not repo_exists:
+                module.fail_json(msg='Repository "%s" '
+                                     'could not be found.' % params['name'])
+            repo = server.get_repo(params['name'])
+            result = dict(changed=False, repo=repo)
+
+    except Error, e:
+        module.fail_json(msg=str(e))
+
+    module.exit_json(**result)
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()

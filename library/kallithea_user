@@ -1,0 +1,552 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Ansible-module to manage Kallithea/RhodeCode users
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: kallithea_user
+short_description: Manage Kallithea/RhodeCode users.
+description:
+  - Manage Kallithea/RhodeCode users.
+options:
+  active:
+    description:
+      - Wether the user shall be active.
+    required: false
+    default: Server default
+  admin:
+    description:
+      - Wether the user shall be an administrator.
+    required: false
+    default: Server default
+  api_key:
+    description:
+      - Kallithea/RhodeCode API key.
+      - The user to whom I(api_key) belongs must have all necessary
+        permissions.
+        to query, create, update and remove users.
+      - 'Alias: I(key)'
+    required: true
+  auth_method=dict():
+    description:
+      - Authentication method (plugin name).
+      - For RhodeCode, method C(internal) gets converted to RhodeCode's
+        internal representation C(rhodecode)
+      - 'Alias: I(auth)'
+    required: false
+    choices: [internal, container, crowd, ldap, pam]
+    default: Server default.
+  email:
+    description:
+      - User email.
+      - Required for new users.
+    required: false
+  first_name:
+    description:
+      - The user's first name.
+    required: false
+  force_password:
+    description:
+      - If C(true), overwrite passwords of existing users.
+      - If C(false), dont' change the password of existing users, even if
+        I(password) is supplied.
+    required: false
+    default: false
+  last_name:
+    description:
+      - The user's last name.
+    required: false
+  login:
+    description:
+      - Kallithea/RhodeCode login name.
+      - 'Alias: I(name)'
+    required: true
+  password:
+    description:
+      - The user's password.
+    required: false
+  state:
+    description:
+      - Whether the user should exist or not.
+      - If I(state) is C(query), information about the specified user is
+        returned while nothing is changed.
+    choices: [present, absent, query]
+    required: false
+    default: present
+  url:
+    description:
+      - Kallithea/RhodeCode API URL.
+    required: false
+    default: https://localhost/_admin/api
+notes:
+  - At least Kallithea 0.0 or RhodeCode 2.2.5 required.
+  - Compatibility to RhodeCode is assumed, but not guaranteed. It is possible
+    that RhodeCode support might be dropped in the future.
+  - Authentication methods C(container), C(crowd) and C(pam) are not yet
+    extensively tested.
+  - This module does not support addressing users via their user id.
+  - For URLs pointing to C(localhost)/C(127.0.0.1), SSL certificate
+    validation is disabled.
+
+requirements: [requests]
+author: Bernhard Weitzhofer
+'''
+
+EXAMPLES = '''
+# Ensure "reed" exists. All unspecified values are set according to
+# Kallithea/RhodeCode server defaults.
+- kallithea_user: >
+    state=present
+    api_key=SOME_API_KEY
+    login=reed
+    email=reed@baxterbuilding.com
+
+# Ensure user "reed" is an admin. All unspecified values are kept as they are.
+- kallithea_user: >
+    api_key=SOME_API_KEY
+    login=reed
+    admin=yes
+
+# Ensure user "victor" is removed
+- kallithea_repo: >
+    api_key=SOME_API_KEY
+    login=victor
+    state=absent
+'''
+
+###############################################################################
+#                                                                             #
+# The following code is the same for all Kallithea (kallithea_*) Modules.     #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+
+import json
+import re
+import urlparse
+import uuid
+try:
+    # requests does not support Python 2.4, but since this seems to be the case
+    # for other libraries used by the modules in Ansible core as well (current
+    # psycopg2 for example), functionallity of requests won't be replicated
+    # here for the moment.
+    import requests
+except ImportError:
+    requests = None
+
+
+class Error(Exception):
+    '''Custom base class for errors'''
+
+
+class APIError(Error):
+    '''Base class for errors reported by the Kallithea API'''
+
+
+# Workaround for the fact that Python 2.4 does not have "any" built-in.
+def any(iterable):
+    '''Return True if at least one element of iterable evaluates True.'''
+    for element in iterable:
+        if element:
+            return True
+    return False
+
+
+# Workaround for the fact that Python 2.4 does not have the 'hostname'
+# property for urlparse.urlsplit()-results (code adapted from recent
+# Python's urlparse.ResultMixin).
+def hostname(url):
+    '''Return hostname part of url or None if not existent.'''
+    netloc_ = urlparse.urlsplit(url)[1]
+    netloc = netloc_.split('@')[-1]
+    if '[' in netloc and ']' in netloc:
+        return netloc.split(']')[0][1:].lower()
+    elif ':' in netloc:
+        return netloc.split(':')[0].lower()
+    elif netloc == '':
+        return None
+    else:
+        return netloc.lower()
+
+
+def dict_without_none(*args, **kwargs):
+    '''Return Dictionary with entries having value None discarded.'''
+    dct = dict(*args, **kwargs)
+    return dict((k, v) for k, v in dct.iteritems() if v is not None)
+
+
+class Version(object):
+    '''Class representing comparable Software version Information.'''
+
+    def __init__(self, version_string):
+        self.verstr = version_string
+        self.ver = []
+        for part in version_string.split('.'):
+
+            # Split "num" and "rest" for each part of a version number. Any
+            # rest is considered smaller than no rest (the empty tuple is
+            # bigger than any string in Python 2)
+            raw_num, rest_ = re.match(r'([0-9]*)(.*)', part).groups()
+            num = int(raw_num or '0')
+            rest = rest_ or ()
+
+            self.ver.append((num, rest))
+
+    def __repr__(self):
+        return 'Version(%s)' % self.verstr
+
+    def __str__(self):
+        return self.verstr
+
+    def __cmp__(self, other):
+
+        # Pad with tuples representing zeroes (see __init__)
+        pad = lambda a, b: (a or (0, ()), b or (0, ()))
+        zipped_longest = map(pad, self.ver, other.ver)
+        s, o = zip(*zipped_longest)
+
+        if s < o:
+            return -1
+        elif s > o:
+            return 1
+        else:
+            return 0
+
+
+class Api(object):
+    '''A class to represent Kallithea's/RhodeCode's JSON-RPC-API'''
+
+    def __init__(self, url, api_key):
+        self.url = url
+        self.api_key = api_key
+        self._server_info = None
+
+        # prepare session
+        self.session = requests.Session()
+        self.session.headers.update({'content-type': 'application/json'})
+
+        # Don't verify SSL cert of local server (hostname wouldn't match)
+        if hostname(self.url) in ('localhost', '127.0.0.1'):
+            self.session.verify = False
+
+    def call(self, method, **kwargs):
+        '''Call a method of the Kallithea JSON-RPC API, return its results.'''
+        id_ = str(uuid.uuid4())  # a random uuid
+        payload = {
+            'id': id_,
+            'api_key': self.api_key,
+            'method': method,
+            'args': kwargs
+        }
+        try:
+            response = self.session.post(self.url, data=json.dumps(payload))
+        except Exception, e:
+            raise Error('%s: %s' % (type(e), e))
+
+        if response.status_code != 200:
+            raise Error('HTTP response had status code other than 200. '
+                        'This should not happen.')
+        data = response.json()
+        if data['id'] != id_:
+            raise Error('Response contained wrong id. This should not happen.')
+        if data['error'] is not None:
+            raise APIError(data['error'])
+        return data['result']
+
+    # shortcut for Client.call: client('foo', bar='baz') instead of
+    # client.call('foo', bar='baz')
+    __call__ = call
+
+    def _get_method(self, method):
+        '''Return a callable that calls a specific API method.'''
+
+        def m(**kwargs):
+            return self.call(method, **kwargs)
+
+        m.__doc__ = 'Return result of JSON-RPC API method "%s".' % method
+        return m
+
+    def __getattr__(self, name):
+        '''Return callable that calls API method corresponding to attr name.
+
+        This makes it possible to call client.foo(bar='baz') instead of
+        client.call('foo', bar='baz').
+
+        '''
+        return self._get_method(name)
+
+#                                                                             #
+# The above code is the same for all Kallithea (kallithea_*) Modules.         #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+###############################################################################
+
+
+class Stub(object):
+    '''Server Stub for Kallithea/RhodeCode (common functionality)'''
+
+    def __init__(self, api):
+        self.api = api
+
+    def user_exists(self, login):
+        '''Return True if user exists on Server.'''
+        # TODO: don't query ALL repositories
+        users = self.api.get_users()
+        return any(u['username'] == login for u in users)
+
+    def get_user(self, login):
+        '''Return user information'''
+        u = self.api.get_user(userid=login)
+        return dict(
+            active=u['active'],
+            admin=u['admin'],
+            auth_method=u['extern_type'],
+            email=u['email'],
+            first_name=u['firstname'],
+            last_name=u['lastname'],
+            login=u['username'],
+        )
+
+    def diff_user(self,
+                  login,
+                  active=None,
+                  admin=None,
+                  auth_method=None,
+                  email=None,
+                  first_name=None,
+                  last_name=None,
+                  password=None,
+                  **throwaway):
+        '''Return keys whose values differ from current ones ...
+
+        ... for user with specified login. None-values supplied to this method
+        are disregarded in the comparison.
+
+        '''
+        current = self.get_user(login)
+        current['password'] = -1  # make up illegal password
+        supplied = dict_without_none(
+            active=active,
+            admin=admin,
+            auth_method=auth_method,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            login=login,
+            password=password,
+        )
+        return [k for k, v in supplied.iteritems() if v != current[k]]
+
+    def create_user(self,
+                    login,
+                    active=None,
+                    admin=None,
+                    auth_method=None,
+                    email=None,
+                    first_name=None,
+                    last_name=None,
+                    password=None,
+                    **throwaway):
+        '''Create user, return result of API call.'''
+        kwargs = dict_without_none(
+            active=active,
+            admin=admin,
+            email=email,
+            extern_type=auth_method,
+            firstname=first_name,
+            lastname=last_name,
+            username=login,
+            password=password,
+        )
+
+        # supply empty extern Name so it doesn't get automatically set to
+        # anything that would confuse external auth plugins
+        kwargs['extern_name'] = None
+
+        return self.api.create_user(**kwargs)
+
+    def update_user(self,
+                    login,
+                    active=None,
+                    admin=None,
+                    email=None,
+                    first_name=None,
+                    last_name=None,
+                    password=None,
+                    **throwaway):
+        '''Update user, return result of API call.'''
+        kwargs = dict_without_none(
+            active=active,
+            admin=admin,
+            email=email,
+            firstname=first_name,
+            lastname=last_name,
+            userid=login,
+            password=password,
+        )
+        return self.api.update_user(**kwargs)
+
+    def delete_user(self, login):
+        '''Delete user, return result of API call.'''
+        return self.api.delete_user(userid=login)
+
+
+class KallitheaStub(Stub):
+    '''Server stub for Kallithea (Kallithea-specific functionality)'''
+
+    # Add Kallithea-specific method overrides/implementations here
+
+
+class RhodeCodeStub(Stub):
+    '''Server stub for RhodeCode (RhodeCode-specific unctionality)'''
+
+    def get_user(self, login):
+        result = super(RhodeCodeStub, self).get_user(login)
+        if result.get('auth_method') == 'rhodecode':
+            result['auth_method'] == 'internal'
+        return result
+
+    def create_user(self, **kwargs):
+        if kwargs.get('auth_method') == 'internal':
+            kwargs['auth_method'] == 'rhodecode'
+        return super(RhodeCodeStub, self).create_user(**kwargs)
+
+    # Add more RhodeCode-specific method overrides/implementations here
+
+
+def get_stub(api):
+    '''Determine server type and return corresponding stub.'''
+
+    # Minimum server versions
+    KALLITHEA_MIN_VER = Version('0.0')
+    RHODECODE_MIN_VER = Version('2.2.5')
+
+    # get server info
+    server_info = api.get_server_info()
+
+    # Create Server Stub based on server_info or fail
+    if 'kallithea_version' in server_info:
+        ver = Version(server_info['kallithea_version'])
+        if ver < KALLITHEA_MIN_VER:
+            raise Error('At least Kallithea %s required.' %
+                        KALLITHEA_MIN_VER)
+        return KallitheaStub(api)
+    elif 'rhodecode_version' in server_info:
+        ver = Version(server_info['rhodecode_version'])
+        if ver < RHODECODE_MIN_VER:
+            raise Error('At least RhodeCode %s required.' %
+                        RHODECODE_MIN_VER)
+        return RhodeCodeStub(api)
+    raise Error('Could not determine server type')
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            active=dict(type='bool'),
+            admin=dict(type='bool'),
+            api_key=dict(required=True, aliases=['key']),
+            auth_method=dict(choices=['internal',
+                                      'container', 'crowd', 'ldap', 'pam'],
+                             aliases=['auth']),
+            email=dict(),
+            first_name=dict(),
+            force_password=dict(type='bool', default=False),
+            last_name=dict(),
+            login=dict(required=True, aliases=['name']),
+            password=dict(),
+            state=dict(default='present',
+                       choices=['present', 'absent', 'query']),
+            url=dict(default='https://localhost/_admin/api'),
+        ),
+        supports_check_mode=True
+    )
+    params = module.params
+
+    # fail if import of requests failed
+    if not requests:
+        module.fail_json(msg='Python module "requests" must be installed.')
+
+    try:
+        api = Api(params['url'], params['api_key'])
+        server = get_stub(api)
+
+        # see if user exist
+        user_exists = server.user_exists(params['login'])
+
+        if params['state'] == 'present':
+            if not user_exists:
+
+                # fail if email not specified
+                if not params['email']:
+                    module.fail_json(msg='email= is required for new users')
+
+                # create user (or pretend to if check_mode)
+                if module.check_mode:
+                    result = dict(changed=True)
+                else:
+                    r = server.create_user(**params)
+                    result = dict(changed=True, result=r)
+
+            else:  # user exists
+                # set password only if explicitly requested & supplied
+                pwd = params['force_password'] and params['password'] or None
+
+                # determine which fields would change
+                diff = server.diff_user(**params)
+
+                # fail request to switch between authentication methods
+                if 'auth_method' in diff:
+                    module.fail_json(msg='The authentication method of an '
+                                         'existing user cannot be changed.')
+
+                # update user if necessary (or pretend to if check mode)
+                if module.check_mode:
+                    result = dict(changed=bool(diff))
+                elif diff:
+                    r = server.update_user(**params)
+                    result = dict(changed=True, changed_attrs=diff, result=r)
+                else:
+                    result = dict(changed=False)
+
+        elif params['state'] == 'absent':
+            changed = user_exists
+
+            # remove user if necessary (or pretend to if check mode)
+            if module.check_mode:
+                result = dict(changed=changed)
+            elif changed:
+                r = server.delete_user(params['login'])
+                result = dict(changed=True, result=r)
+            else:
+                result = dict(changed=False)
+
+        else:  # state == 'query'
+            if not user_exists:
+                module.fail_json(msg='User "%s" '
+                                     'could not be found.' % params['login'])
+            r = server.get_user(params.login)
+            result = dict(changed=False, result=r)
+
+    except Error, e:
+        module.fail_json(msg=str(e))
+
+    module.exit_json(**result)
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()

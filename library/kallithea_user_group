@@ -1,0 +1,455 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Ansible-module to manage Kallithea/RhodeCode user groups
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: kallithea_user_group
+short_description: Manage Kallithea/RhodeCode user groups.
+description:
+  - Manage Kallithea/RhodeCode user groups.
+options:
+  active:
+    description:
+      - Whether the user group shall be active.
+    required: false
+    default: Server default
+  api_key:
+    description:
+      - Kallithea/RhodeCode API key.
+      - The user to whom I(api_key) belongs must have all necessary
+        permissions.
+      - 'Alias: I(key)'
+    required: true
+  description:
+    description:
+      - User group description.
+    required: false
+    default: Server default
+  name:
+    description:
+      - User group name.
+    required: true
+  owner:
+    description:
+      - User group owner.
+    required: false
+    default: Server default
+  state:
+    description:
+      - Whether the user group should exist or not.
+      - If I(state) is C(query), information about the specified user group is
+        returned while nothing is changed.
+    choices: [present, absent, query]
+    required: false
+    default: present
+  url:
+    description:
+      - Kallithea API URL.
+    required: false
+    default: https://localhost/_admin/api
+notes:
+  - At least Kallithea 0.0 or RhodeCode 2.2.5 required.
+  - Compatibility to RhodeCode is assumed, but not guaranteed. It is possible
+    that RhodeCode support might be dropped in the future.
+  - This module does not support addressing user groups via their user group
+    id.
+  - For URLs pointing to C(localhost)/C(127.0.0.1), SSL certificate
+    validation is disabled.
+
+requirements: [requests]
+author: Bernhard Weitzhofer
+'''
+
+EXAMPLES = '''
+# Make sure a certain user group exists
+- kallithea_user_group: >
+    api_key=SOME_API_KEY
+    name=fantastic_four
+    description="The Fantastic Four"
+    owner=reed
+
+# Ensure a certain user group does not exist
+- kallithea_user_group: >
+    api_key=SOME_API_KEY
+    state=absent
+    name=salems_seven
+'''
+
+###############################################################################
+#                                                                             #
+# The following code is the same for all Kallithea (kallithea_*) Modules.     #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+
+import json
+import re
+import urlparse
+import uuid
+try:
+    # requests does not support Python 2.4, but since this seems to be the case
+    # for other libraries used by the modules in Ansible core as well (current
+    # psycopg2 for example), functionallity of requests won't be replicated
+    # here for the moment.
+    import requests
+except ImportError:
+    requests = None
+
+
+class Error(Exception):
+    '''Custom base class for errors'''
+
+
+class APIError(Error):
+    '''Base class for errors reported by the Kallithea API'''
+
+
+# Workaround for the fact that Python 2.4 does not have "any" built-in.
+def any(iterable):
+    '''Return True if at least one element of iterable evaluates True.'''
+    for element in iterable:
+        if element:
+            return True
+    return False
+
+
+# Workaround for the fact that Python 2.4 does not have the 'hostname'
+# property for urlparse.urlsplit()-results (code adapted from recent
+# Python's urlparse.ResultMixin).
+def hostname(url):
+    '''Return hostname part of url or None if not existent.'''
+    netloc_ = urlparse.urlsplit(url)[1]
+    netloc = netloc_.split('@')[-1]
+    if '[' in netloc and ']' in netloc:
+        return netloc.split(']')[0][1:].lower()
+    elif ':' in netloc:
+        return netloc.split(':')[0].lower()
+    elif netloc == '':
+        return None
+    else:
+        return netloc.lower()
+
+
+def dict_without_none(*args, **kwargs):
+    '''Return Dictionary with entries having value None discarded.'''
+    dct = dict(*args, **kwargs)
+    return dict((k, v) for k, v in dct.iteritems() if v is not None)
+
+
+class Version(object):
+    '''Class representing comparable Software version Information.'''
+
+    def __init__(self, version_string):
+        self.verstr = version_string
+        self.ver = []
+        for part in version_string.split('.'):
+
+            # Split "num" and "rest" for each part of a version number. Any
+            # rest is considered smaller than no rest (the empty tuple is
+            # bigger than any string in Python 2)
+            raw_num, rest_ = re.match(r'([0-9]*)(.*)', part).groups()
+            num = int(raw_num or '0')
+            rest = rest_ or ()
+
+            self.ver.append((num, rest))
+
+    def __repr__(self):
+        return 'Version(%s)' % self.verstr
+
+    def __str__(self):
+        return self.verstr
+
+    def __cmp__(self, other):
+
+        # Pad with tuples representing zeroes (see __init__)
+        pad = lambda a, b: (a or (0, ()), b or (0, ()))
+        zipped_longest = map(pad, self.ver, other.ver)
+        s, o = zip(*zipped_longest)
+
+        if s < o:
+            return -1
+        elif s > o:
+            return 1
+        else:
+            return 0
+
+
+class Api(object):
+    '''A class to represent Kallithea's/RhodeCode's JSON-RPC-API'''
+
+    def __init__(self, url, api_key):
+        self.url = url
+        self.api_key = api_key
+        self._server_info = None
+
+        # prepare session
+        self.session = requests.Session()
+        self.session.headers.update({'content-type': 'application/json'})
+
+        # Don't verify SSL cert of local server (hostname wouldn't match)
+        if hostname(self.url) in ('localhost', '127.0.0.1'):
+            self.session.verify = False
+
+    def call(self, method, **kwargs):
+        '''Call a method of the Kallithea JSON-RPC API, return its results.'''
+        id_ = str(uuid.uuid4())  # a random uuid
+        payload = {
+            'id': id_,
+            'api_key': self.api_key,
+            'method': method,
+            'args': kwargs
+        }
+        try:
+            response = self.session.post(self.url, data=json.dumps(payload))
+        except Exception, e:
+            raise Error('%s: %s' % (type(e), e))
+
+        if response.status_code != 200:
+            raise Error('HTTP response had status code other than 200. '
+                        'This should not happen.')
+        data = response.json()
+        if data['id'] != id_:
+            raise Error('Response contained wrong id. This should not happen.')
+        if data['error'] is not None:
+            raise APIError(data['error'])
+        return data['result']
+
+    # shortcut for Client.call: client('foo', bar='baz') instead of
+    # client.call('foo', bar='baz')
+    __call__ = call
+
+    def _get_method(self, method):
+        '''Return a callable that calls a specific API method.'''
+
+        def m(**kwargs):
+            return self.call(method, **kwargs)
+
+        m.__doc__ = 'Return result of JSON-RPC API method "%s".' % method
+        return m
+
+    def __getattr__(self, name):
+        '''Return callable that calls API method corresponding to attr name.
+
+        This makes it possible to call client.foo(bar='baz') instead of
+        client.call('foo', bar='baz').
+
+        '''
+        return self._get_method(name)
+
+#                                                                             #
+# The above code is the same for all Kallithea (kallithea_*) Modules.         #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+###############################################################################
+
+
+class Stub(object):
+    '''Server Stub for Kallithea/RhodeCode (common functionality)'''
+
+    def __init__(self, api):
+        self.api = api
+
+    def user_group_exists(self, name):
+        '''Return True if user group exists on Server.'''
+        # TODO: don't query ALL groups
+        groups = self.api.get_user_groups()
+        return any(g['group_name'] == name for g in groups)
+
+    def get_user_group(self, name):
+        '''Return user group information'''
+        g = self.api.get_user_group(usergroupid=name)
+        return dict(
+            active=g['active'],
+            description=g['group_description'],
+            members=g['members'],
+            name=g['group_name'],
+            owner=g['owner'],
+        )
+
+    def diff_user_group(self,
+                        name,
+                        active=None,
+                        description=None,
+                        owner=None,
+                        **throwaway):
+        '''Return keys whose values differ from current ones ...
+
+        ... for user group with specified name. None-values supplied to this
+        method are disregarded in the comparison.
+
+        '''
+        current = self.get_user_group(name)
+        supplied = dict_without_none(
+            active=active,
+            description=description,
+            name=name,
+            owner=owner,
+        )
+        return [k for k, v in supplied.iteritems() if v != current[k]]
+
+    def create_user_group(self,
+                          name,
+                          active=None,
+                          description=None,
+                          owner=None,
+                          **throwaway):
+        '''Create user group, return result of API call.'''
+        kwargs = dict_without_none(
+            active=active,
+            description=description,
+            group_name=name,
+            owner=owner,
+        )
+        return self.api.create_user_group(**kwargs)
+
+    def update_user_group(self,
+                          name,
+                          active=None,
+                          description=None,
+                          owner=None,
+                          **throwaway):
+        '''Update user group, return result of API call.'''
+        kwargs = dict_without_none(
+            active=active,
+            description=description,
+            usergroupid=name,
+            owner=owner,
+        )
+        return self.api.update_user_group(**kwargs)
+
+    def delete_user_group(self, name):
+        '''Delete user group, return result of API call.'''
+        return self.api.delete_user_group(usergroupid=name)
+
+
+class KallitheaStub(Stub):
+    '''Server stub for Kallithea (Kallithea-specific functionality)'''
+
+    # Add Kallithea-specific method overrides/implementations here
+
+
+class RhodeCodeStub(Stub):
+    '''Server stub for RhodeCode (RhodeCode-specific unctionality)'''
+
+    # Add RhodeCode-specific method overrides/implementations here
+
+
+def get_stub(api):
+    '''Determine server type and return corresponding stub.'''
+
+    # Minimum server versions
+    KALLITHEA_MIN_VER = Version('0.0')
+    RHODECODE_MIN_VER = Version('2.2.5')
+
+    # get server info
+    server_info = api.get_server_info()
+
+    # Create Server Stub based on server_info or fail
+    if 'kallithea_version' in server_info:
+        ver = Version(server_info['kallithea_version'])
+        if ver < KALLITHEA_MIN_VER:
+            raise Error('At least Kallithea %s required.' %
+                        KALLITHEA_MIN_VER)
+        return KallitheaStub(api)
+    elif 'rhodecode_version' in server_info:
+        ver = Version(server_info['rhodecode_version'])
+        if ver < RHODECODE_MIN_VER:
+            raise Error('At least RhodeCode %s required.' %
+                        RHODECODE_MIN_VER)
+        return RhodeCodeStub(api)
+    raise Error('Could not determine server type')
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            active=dict(type='bool'),
+            api_key=dict(required=True, aliases=['key']),
+            description=dict(),
+            name=dict(required=True),
+            owner=dict(),
+            state=dict(default='present',
+                       choices=['present', 'absent', 'query']),
+            url=dict(default='https://localhost/_admin/api'),
+        ),
+        supports_check_mode=True
+    )
+    params = module.params
+
+    # fail if import of requests failed
+    if not requests:
+        module.fail_json(msg='Python module "requests" must be installed.')
+
+    try:
+        api = Api(params['url'], params['api_key'])
+        server = get_stub(api)
+
+        # see if user group exists
+        group_exists = server.user_group_exists(params['name'])
+
+        if params['state'] == 'present':
+            if not group_exists:
+                # create user group (or pretend to if check mode)
+                if module.check_mode:
+                    result = dict(changed=True)
+                else:
+                    r = server.create_user_group(**params)
+                    result = dict(changed=True, result=r)
+
+            else:  # user group exists
+                # determine which fields would change
+                diff = server.diff_user_group(**params)
+
+                # update user group if necessary (or pretend to if check mode)
+                if module.check_mode:
+                    result = dict(changed=bool(diff))
+                elif diff:
+                    r = server.update_user_group(**params)
+                    result = dict(changed=True, changed_attrs=diff, result=r)
+                else:
+                    result = dict(changed=False)
+
+        elif params['state'] == 'absent':
+
+            # changed if user group exists
+            changed = group_exists
+
+            # remove user group if necessary (or pretend to if check mode)
+            if module.check_mode:
+                result = dict(changed=changed)
+            elif changed:
+                r = server.delete_user_group(params['name'])
+                result = dict(changed=True, result=r)
+            else:
+                result = dict(changed=False)
+
+        else:  # state == 'query'
+            if not group_exists:
+                module.fail_json(msg='User group "%s" '
+                                     'could not be found.' % params['name'])
+            user_group = server.get_user_group(params['name'])
+            result = dict(changed=False, user_group=user_group)
+
+    except Error, e:
+        module.fail_json(msg=str(e))
+
+    module.exit_json(**result)
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()

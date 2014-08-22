@@ -1,0 +1,664 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Ansible-module to manage Kallithea/RhodeCode permissions
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: kallithea_perm
+short_description: Manage Kallithea/RhodeCode permissions.
+description:
+  - Manage Kallithea/RhodeCode permissions.
+  - Permissions can be managed for either repositories and repository groups.
+  - Permissions can be granted to/revoked from users and user groups.
+options:
+  api_key:
+    description:
+      - Kallithea/RhodeCode API key.
+      - The user to whom I(api_key) belongs must have all necessary
+        permissions.
+      - 'Alias: I(key)'
+    required: true
+  perm:
+    description:
+      - For I(state)=C(present): which permission to grant.
+      - C(none) is a valid option here. Note that this is different from
+        removing the permission entry alltogether with I(state)=C(absent)
+      - 'Alias: I(permission)'
+    choices: [read, write, admin, none]
+    required: false
+    default: read
+  repos:
+    description:
+      - Comma separated list of repositories to manage permissions for.
+      - 'Alias: I(repo)'
+    required: false
+  repo_groups:
+    description:
+      - Comma separated list of repository groups to manage permissions for.
+      - 'Alias: I(repo_group)'
+    required: false
+  state:
+    description:
+      - Whether the permission entry should exist or not.
+    choices: [present, absent]
+    required: false
+    default: present
+  url:
+    description:
+      - Kallithea API URL.
+    required: false
+    default: https://localhost/_admin/api
+  users:
+    description:
+      - Comma separated list of users to grant/revoke permissions to/from.
+      - 'Alias: I(user)'
+    required: false
+  user_groups:
+    description:
+      - Comma separated list of user groups to grant/revoke permissions
+        to/from.
+      - 'Alias: I(user_group)'
+    required: false
+notes:
+  - At least Kallithea 0.0 or RhodeCode 2.2.5 required.
+  - Compatibility to RhodeCode is assumed, but not guaranteed. It is possible
+    that RhodeCode support might be dropped in the future.
+  - This module does not support addressing repositories, repository groups,
+    users or user groups via their id values.
+  - Currently Kallithea/Rhodecode support way more permission combinations than
+    exported via their respective JSON-RPC-APIs (especially default
+    permissions). This means not every possible combination can be achieved via
+    this module.
+  - Currently this module I(always) reports changes to user group permissions,
+    since these cannot be queried.
+  - For URLs pointing to C(localhost)/C(127.0.0.1), SSL certificate
+    validation is disabled.
+requirements: [requests]
+author: Bernhard Weitzhofer
+'''
+
+EXAMPLES = '''
+# Make sure user group "fantastic_four" has write permissions
+# on repository group "research_projects"
+- kallithea_perm: >
+    api_key=SOME_API_KEY
+    user_group=fantastic_four
+    permissoin=write
+    repo_group=research_projects
+
+# Make sure user "reed" has admin permission on two repositories
+- kallithea_perm: >
+    api_key=SOME_API_KEY
+    user=reed
+    permission=admin
+    repos=research_projects/fantastiflare,research_projects/uniform_computer
+
+# Make sure user "susan" and user group "avengers" have read permission on
+# repository group "research_projects" and repository "accounting/contracts"
+- kallithea_perm: >
+    api_key=SOME_API_KEY
+    user=susan
+    user_group=avengers
+    permission=read
+    repo=accounting/contracts
+    repo_group=research_projects
+'''
+
+###############################################################################
+#                                                                             #
+# The following code is the same for all Kallithea (kallithea_*) Modules.     #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+
+import json
+import re
+import urlparse
+import uuid
+try:
+    # requests does not support Python 2.4, but since this seems to be the case
+    # for other libraries used by the modules in Ansible core as well (current
+    # psycopg2 for example), functionallity of requests won't be replicated
+    # here for the moment.
+    import requests
+except ImportError:
+    requests = None
+
+
+class Error(Exception):
+    '''Custom base class for errors'''
+
+
+class APIError(Error):
+    '''Base class for errors reported by the Kallithea API'''
+
+
+# Workaround for the fact that Python 2.4 does not have "any" built-in.
+def any(iterable):
+    '''Return True if at least one element of iterable evaluates True.'''
+    for element in iterable:
+        if element:
+            return True
+    return False
+
+
+# Workaround for the fact that Python 2.4 does not have the 'hostname'
+# property for urlparse.urlsplit()-results (code adapted from recent
+# Python's urlparse.ResultMixin).
+def hostname(url):
+    '''Return hostname part of url or None if not existent.'''
+    netloc_ = urlparse.urlsplit(url)[1]
+    netloc = netloc_.split('@')[-1]
+    if '[' in netloc and ']' in netloc:
+        return netloc.split(']')[0][1:].lower()
+    elif ':' in netloc:
+        return netloc.split(':')[0].lower()
+    elif netloc == '':
+        return None
+    else:
+        return netloc.lower()
+
+
+def dict_without_none(*args, **kwargs):
+    '''Return Dictionary with entries having value None discarded.'''
+    dct = dict(*args, **kwargs)
+    return dict((k, v) for k, v in dct.iteritems() if v is not None)
+
+
+class Version(object):
+    '''Class representing comparable Software version Information.'''
+
+    def __init__(self, version_string):
+        self.verstr = version_string
+        self.ver = []
+        for part in version_string.split('.'):
+
+            # Split "num" and "rest" for each part of a version number. Any
+            # rest is considered smaller than no rest (the empty tuple is
+            # bigger than any string in Python 2)
+            raw_num, rest_ = re.match(r'([0-9]*)(.*)', part).groups()
+            num = int(raw_num or '0')
+            rest = rest_ or ()
+
+            self.ver.append((num, rest))
+
+    def __repr__(self):
+        return 'Version(%s)' % self.verstr
+
+    def __str__(self):
+        return self.verstr
+
+    def __cmp__(self, other):
+
+        # Pad with tuples representing zeroes (see __init__)
+        pad = lambda a, b: (a or (0, ()), b or (0, ()))
+        zipped_longest = map(pad, self.ver, other.ver)
+        s, o = zip(*zipped_longest)
+
+        if s < o:
+            return -1
+        elif s > o:
+            return 1
+        else:
+            return 0
+
+
+class Api(object):
+    '''A class to represent Kallithea's/RhodeCode's JSON-RPC-API'''
+
+    def __init__(self, url, api_key):
+        self.url = url
+        self.api_key = api_key
+        self._server_info = None
+
+        # prepare session
+        self.session = requests.Session()
+        self.session.headers.update({'content-type': 'application/json'})
+
+        # Don't verify SSL cert of local server (hostname wouldn't match)
+        if hostname(self.url) in ('localhost', '127.0.0.1'):
+            self.session.verify = False
+
+    def call(self, method, **kwargs):
+        '''Call a method of the Kallithea JSON-RPC API, return its results.'''
+        id_ = str(uuid.uuid4())  # a random uuid
+        payload = {
+            'id': id_,
+            'api_key': self.api_key,
+            'method': method,
+            'args': kwargs
+        }
+        try:
+            response = self.session.post(self.url, data=json.dumps(payload))
+        except Exception, e:
+            raise Error('%s: %s' % (type(e), e))
+
+        if response.status_code != 200:
+            raise Error('HTTP response had status code other than 200. '
+                        'This should not happen.')
+        data = response.json()
+        if data['id'] != id_:
+            raise Error('Response contained wrong id. This should not happen.')
+        if data['error'] is not None:
+            raise APIError(data['error'])
+        return data['result']
+
+    # shortcut for Client.call: client('foo', bar='baz') instead of
+    # client.call('foo', bar='baz')
+    __call__ = call
+
+    def _get_method(self, method):
+        '''Return a callable that calls a specific API method.'''
+
+        def m(**kwargs):
+            return self.call(method, **kwargs)
+
+        m.__doc__ = 'Return result of JSON-RPC API method "%s".' % method
+        return m
+
+    def __getattr__(self, name):
+        '''Return callable that calls API method corresponding to attr name.
+
+        This makes it possible to call client.foo(bar='baz') instead of
+        client.call('foo', bar='baz').
+
+        '''
+        return self._get_method(name)
+
+#                                                                             #
+# The above code is the same for all Kallithea (kallithea_*) Modules.         #
+# Changes made here should be made in the other modules as well.              #
+#                                                                             #
+###############################################################################
+
+
+class Stub(object):
+    '''Server Stub for Kallithea/RhodeCode (common functionality).
+
+    For the methods of this class, a "permission dict" is a dict containing
+    permissions for repositories and repository groups like the
+    following:
+
+    some_permission_dict = {
+        'repo_perms': {'somerepo': 'write', 'otherrepo': 'read'},
+        'repo_group_perms': {'somegroup': 'none', 'othergroup': 'admin'}
+    }
+
+    A "target", for the methods of this class, is a dict containing lists
+    of repository names and repository group names for which permissions have
+    to be changed (or removed), just like the following:
+
+    some_target = {
+        'repos': ['somerepo', 'anotherrepo'],
+        'repo_groups': ['somegroup']
+    }
+
+    '''
+
+    def __init__(self, api):
+        self.api = api
+
+    def _extract_perm_dicts(self, user_or_group_dicts):
+        '''Return mapping of user (group) names to permission dicts.
+
+        Input is a mapping of user (group) names to user (group) dicts as
+        returned by get_user_dicts_or_fail (or get_user_group_dicts_or_fail).
+
+        '''
+        perms = {}
+        for name, dct in user_or_group_dicts.iteritems():
+            repo_perms = {}
+            repo_group_perms = {}
+            p = dct['permissions']
+            for repo, perm in p['repositories'].iteritems():
+                repo_perms[repo] = perm.rsplit('.', 1)[1]
+            for rgroup, perm in p['repositories_groups'].iteritems():  # sic
+                repo_group_perms[rgroup] = perm.rsplit('.', 1)[1]
+            perms[name] = dict(repo_perms=repo_perms,
+                               repo_group_perms=repo_group_perms)
+        return perms
+
+    def _get_grant_targets(self, repos, repo_groups,
+                           current_perm_dicts, target_perm):
+        '''Return mapping of user (group) names to targets ...
+
+        ... so that after processing, every user (or user group) used as a key
+        in current_perm_dicts is granted target_perm on every specified repo
+        (and repo group).
+
+        '''
+        targets = {}
+
+        # for each user (or user group) name and its permission dict ...
+        for uname, perm_dict in current_perm_dicts.iteritems():
+
+            # current repository (group) permissions for user (group)
+            curr_repo_perms = perm_dict['repo_perms']
+            curr_repo_group_perms = perm_dict['repo_group_perms']
+
+            target_repos = []
+            target_repo_groups = []
+
+            # if any specified repo (or repo group) has different (or no) data
+            # in the current permissions, add its name to the target
+            for r in repos:
+                if curr_repo_perms.get(r) != target_perm:
+                    target_repos.append(r)
+            for g in repo_groups:
+                if curr_repo_group_perms.get(g) != target_perm:
+                    target_repo_groups.append(g)
+            targets[uname] = dict(repos=target_repos,
+                                       repo_groups=target_repo_groups)
+        return targets
+
+    def _get_revoke_targets(self, repos, repo_groups, current_perm_dicts):
+        '''Return mapping of user (group) names to targets ...
+
+        ... so that after processing, every user (or user group) used as a key
+        in current_perm_dicts has no permission on every specified repo (and
+        repo group) whatsoever.
+
+        '''
+        targets = {}
+
+        # for each user (or user group) name and its permission dict ...
+        for uname, perm_dict in current_perm_dicts.iteritems():
+
+            # current repository (group) permissions for user (group)
+            curr_repo_perms = perm_dict['repo_perms']
+            curr_repo_group_perms = perm_dict['repo_group_perms']
+
+            target_repos = []
+            target_repo_groups = []
+
+            # if any specified repo (or repo group) has different (or no) data
+            # in the current permissions, add its name to the target dict
+            for r in repos:
+                if r in curr_repo_perms:
+                    target_repos.append(r)
+            for g in repo_groups:
+                if g in curr_repo_group_perms:
+                    target_repo_groups.append(g)
+            targets[uname] = dict(repos=target_repos,
+                                  repo_groups=target_repo_groups)
+        return targets
+
+    def get_repo_dicts(self, repos):
+        '''Return mapping of repo names to repo dicts (or fail).'''
+        getter = self.api.get_repo
+        return dict((r, getter(repoid=r)) for r in repos)
+
+    def get_repo_group_dicts(self, repo_groups):
+        '''Return mapping of repo group names to repo group dicts (or fail).'''
+        getter = self.api.get_repo_group
+        return dict((g, getter(repogroupid=g)) for g in repo_groups)
+
+    def get_user_dicts(self, users):
+        '''Return mapping of user names to user dicts (or fail).'''
+        getter = self.api.get_user
+        return dict((u, getter(userid=u)) for u in users)
+
+    def get_user_group_dicts(self, user_groups):
+        '''Return mapping of user group names to user group dicts (or fail).'''
+        getter = self.api.get_user_group
+        return dict((g, getter(usergroupid=g)) for g in user_groups)
+
+    def get_user_perm_dicts(self, users):
+        '''Return mapping of user names to permission dicts.'''
+        user_dicts = self.get_user_dicts(users)
+        return self._extract_perm_dicts(user_dicts)
+
+    def get_user_group_perm_dicts(self, user_groups):
+        '''Return mapping of user group names to permission dicts.'''
+
+        raise NotImplementedError
+
+        # The following lines DO NOT WORK since Kallithea's API doesn't supply
+        # user group permission information (0.0).
+        # TODO address this
+        #user_group_dicts = self.get_user_group_dicts(user_groups)
+        #return self._extract_perm_dicts(user_group_dicts)
+
+    def get_user_grant_targets(self, repos, repo_groups, users, target_perm):
+        '''Return mapping of user names to grant targets.'''
+        current_perm_dicts = self.get_user_perm_dicts(users)
+        return self._get_grant_targets(repos, repo_groups,
+                                       current_perm_dicts, target_perm)
+
+    def get_user_group_grant_targets(self, repos, repo_groups,
+                                     user_groups, target_perm):
+        '''Return mapping of user group names to grant targets.'''
+        # Fake it till you make it
+        targets = {}
+        for user_group in user_groups:
+            targets[user_group] = {'repos': repos, 'repo_groups': repo_groups}
+        return targets
+        # The following lines DO NOT WORK since Kallithea's API doesn't supply
+        # user group permission information (0.0).
+        # TODO address this
+        #current_perm_dicts = self.get_user_group_perm_dicts(user_groups)
+        #return self._get_grant_targets(repos, repo_groups,
+        #                               current_perm_dicts, target_perm)
+
+    def get_user_revoke_targets(self, repos, repo_groups, users):
+        '''Return mapping of user names to revoke targets.'''
+        current_perm_dicts = self.get_user_perm_dicts(users)
+        return self._get_revoke_targets(repos, repo_groups, current_perm_dicts)
+
+    def get_user_group_revoke_targets(self, repos, repo_groups, user_groups):
+        '''Return mapping of user group names to revoke targets.'''
+        # Fake it till you make it
+        targets = {}
+        for user_group in user_groups:
+            targets[user_group] = {'repos': repos, 'repo_groups': repo_groups}
+        return targets
+        # The following lines DO NOT WORK since Kallithea's API doesn't supply
+        # user group permission information (0.0).
+        # TODO address this
+        #current_perm_dicts = self.get_user_group_perm_dicts(user_groups)
+        #return self._get_revoke_targets(repos, repo_groups,
+        #                                current_perm_dicts)
+
+    def grant_to_users(self, perm, user_grant_targets):
+        '''Grant specified permission for user_grant_targets.'''
+        for user, target in user_grant_targets.iteritems():
+            p = 'repository.%s' % perm
+            for r in target['repos']:
+                self.api.grant_user_permission(
+                    perm=p, userid=user, repoid=r
+                )
+            p = 'group.%s' % perm
+            for rg in target['repo_groups']:
+                self.api.grant_user_permission_to_repo_group(
+                    perm=p, userid=user, repogroupid=rg
+                )
+
+    def grant_to_user_groups(self, perm, user_group_grant_targets):
+        '''Grant specified permission for user_group_grant_targets.'''
+        for user_group, target in user_group_grant_targets.iteritems():
+            p = 'repository.%s' % perm
+            for r in target['repos']:
+                self.api.grant_user_group_permission(
+                    perm=p, usergroupid=user_group, repoid=r
+                )
+            p = 'group.%s' % perm
+            for rg in target['repo_groups']:
+                self.api.grant_user_group_permission_to_repo_group(
+                    perm=p, usergroupid=user_group, repogroupid=rg
+                )
+
+    def revoke_from_users(self, user_revoke_targets):
+        '''Revoke all permissions for user_revoke_targets.'''
+        for user, target in user_revoke_targets.iteritems():
+            for r in target['repos']:
+                self.api.revoke_user_permission(
+                    userid=user, repoid=r
+                )
+            for rg in target['repo_groups']:
+                self.api.revoke_user_permission_from_repo_group(
+                    userid=user, repogroupid=rg
+                )
+
+    def revoke_from_user_groups(self, user_group_revoke_targets):
+        '''Revoke all permissions for user_group_revoke_targets.'''
+        for user_group, target in user_group_revoke_targets.iteritems():
+            for r in target['repos']:
+                self.api.revoke_user_group_permission(
+                    usergroupid=user_group, repoid=r
+                )
+            for rg in target['repo_groups']:
+                self.api.revoke_user_group_permission_from_repo_group(
+                    usergroupid=user_group, repogroupid=rg
+                )
+
+
+class KallitheaStub(Stub):
+    '''Server stub for Kallithea (Kallithea-specific functionality)'''
+
+    # Add Kallithea-specific method overrides/implementations here
+
+
+class RhodeCodeStub(Stub):
+    '''Server stub for RhodeCode (RhodeCode-specific unctionality)'''
+
+    # Add RhodeCode-specific method overrides/implementations here
+
+
+def get_stub(api):
+    '''Determine server type and return corresponding stub.'''
+
+    # Minimum server versions
+    KALLITHEA_MIN_VER = Version('0.0')
+    RHODECODE_MIN_VER = Version('2.2.5')
+
+    # get server info
+    server_info = api.get_server_info()
+
+    # Create Server Stub based on server_info or fail
+    if 'kallithea_version' in server_info:
+        ver = Version(server_info['kallithea_version'])
+        if ver < KALLITHEA_MIN_VER:
+            raise Error('At least Kallithea %s required.' %
+                        KALLITHEA_MIN_VER)
+        return KallitheaStub(api)
+    elif 'rhodecode_version' in server_info:
+        ver = Version(server_info['rhodecode_version'])
+        if ver < RHODECODE_MIN_VER:
+            raise Error('At least RhodeCode %s required.' %
+                        RHODECODE_MIN_VER)
+        return RhodeCodeStub(api)
+    raise Error('Could not determine server type')
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            api_key=dict(required=True, aliases=['key']),
+            perm=dict(
+                default='read',
+                choices=['read', 'write', 'admin', 'none'],
+                aliases=['permission'],
+            ),
+            repos=dict(aliases=['repo']),
+            repo_groups=dict(aliases=['repo_group']),
+            state=dict(default='present', choices=['present', 'absent']),
+            url=dict(default='https://localhost/_admin/api'),
+            users=dict(aliases=['user']),
+            user_groups=dict(aliases=['user_group']),
+        ),
+        supports_check_mode=True,
+    )
+
+    # fail if import of requests failed
+    if not requests:
+        module.fail_json(msg='Python module requests must be installed.')
+
+    # params
+    params = module.params
+    perm = params['perm']
+    repos = params['repos'] and params['repos'].split(',') or []
+    repo_groups = (params['repo_groups'] and
+                   params['repo_groups'].split(',')) or []
+    users = params['users'] and params['users'].split(',') or []
+    user_groups = (params['user_groups'] and
+                   params['user_groups'].split(',')) or []
+
+    # fail if params not ok
+    if 'default' in users:
+        module.fail_json(msg='default user permissions may not be changed.')
+
+    try:
+        api = Api(params['url'], params['api_key'])
+        server = get_stub(api)
+
+        # this fails if any of the specified objects could not be queried
+        server.get_repo_dicts(repos)
+        server.get_repo_group_dicts(repo_groups)
+        server.get_user_group_dicts(user_groups)
+
+        if params['state'] == 'present':
+
+            # determine targets
+            user_targets = server.get_user_grant_targets(
+                    repos, repo_groups, users, perm)
+            user_group_targets = server.get_user_group_grant_targets(
+                    repos, repo_groups, user_groups, perm)
+
+            # determine changed (will anything change?)
+            combined = user_targets.values() + user_group_targets.values()
+            changed = any(t['repos'] or t['repo_groups'] for t in combined)
+
+            # grant permissions if necessary (or pretend to if check mode)
+            if module.check_mode:
+                result = dict(changed=changed)
+            elif changed:
+                server.grant_to_users(perm, user_targets)
+                server.grant_to_user_groups(perm, user_group_targets)
+                result = dict(changed=True)
+            else:
+                result = dict(changed=False)
+
+        else:  # state =='absent':
+
+            # determine targets
+            user_targets = server.get_user_revoke_targets(
+                    repos, repo_groups, users)
+            user_group_targets = server.get_user_group_revoke_targets(
+                    repos, repo_groups, user_groups)
+
+            # determine changed (will anything change?)
+            combined = user_targets.values() + user_group_targets.values()
+            changed = any(t['repos'] or t['repo_groups'] for t in combined)
+
+            # revoke permissions if necessary (or pretend to if check mode)
+            if module.check_mode:
+                result = dict(changed=changed)
+            elif changed:
+                server.revoke_from_users(user_targets)
+                server.revoke_from_user_groups(user_group_targets)
+                result = dict(changed=True)
+            else:
+                result = dict(changed=False)
+
+    except SyntaxError, e:
+        module.fail_json(msg=str(e))
+
+    module.exit_json(**result)
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()
